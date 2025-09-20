@@ -14,6 +14,8 @@
 (define-constant ERR-INVALID-VOTING-PERIOD (err u109))
 (define-constant ERR-PROJECT-ALREADY-EXECUTED (err u110))
 (define-constant ERR-QUORUM-NOT-MET (err u111))
+(define-constant ERR-INVALID-PRINCIPAL (err u112))
+(define-constant ERR-INVALID-STRING-LENGTH (err u113))
 
 ;; Status constants for project states
 (define-constant STATUS-PROPOSED u0)
@@ -27,12 +29,19 @@
 (define-constant MAX-VOTING-PERIOD u1008) ;; Maximum 1008 blocks (approximately 1 week)
 (define-constant MIN-PROPOSAL-AMOUNT u1000000) ;; Minimum 1 STX in microSTX
 (define-constant QUORUM-PERCENTAGE u20) ;; 20% quorum requirement
+(define-constant MIN-TITLE-LENGTH u5)
+(define-constant MAX-TITLE-LENGTH u100)
+(define-constant MIN-DESCRIPTION-LENGTH u10)
+(define-constant MAX-DESCRIPTION-LENGTH u500)
 
 ;; Contract owner and administrative functions
 (define-data-var contract-owner principal tx-sender)
 (define-data-var next-project-id uint u1)
 (define-data-var total-registered-voters uint u0)
 (define-data-var voting-token-required uint u1000000) ;; 1 STX worth of tokens required to vote
+
+;; Authorized admin list for additional security
+(define-map authorized-admins principal bool)
 
 ;; Data structures for projects
 (define-map projects
@@ -74,9 +83,17 @@
   uint
 )
 
+;; Approved recipient addresses for project execution
+(define-map approved-recipients principal bool)
+
 ;; Helper function to check if caller is contract owner
 (define-private (is-contract-owner)
   (is-eq tx-sender (var-get contract-owner))
+)
+
+;; Helper function to check if caller is authorized admin
+(define-private (is-authorized-admin)
+  (or (is-contract-owner) (default-to false (map-get? authorized-admins tx-sender)))
 )
 
 ;; Helper function to get current block height
@@ -98,6 +115,73 @@
 ;; Helper function to calculate quorum requirement
 (define-private (calculate-quorum)
   (/ (* (var-get total-registered-voters) QUORUM-PERCENTAGE) u100)
+)
+
+;; Helper function to validate string length
+(define-private (is-valid-string-length (str (string-ascii 500)) (min-len uint) (max-len uint))
+  (let ((str-len (len str)))
+    (and (>= str-len min-len) (<= str-len max-len))
+  )
+)
+
+;; Helper function to validate title
+(define-private (is-valid-title (title (string-ascii 100)))
+  (is-valid-string-length title MIN-TITLE-LENGTH MAX-TITLE-LENGTH)
+)
+
+;; Helper function to validate description
+(define-private (is-valid-description (description (string-ascii 500)))
+  (is-valid-string-length description MIN-DESCRIPTION-LENGTH MAX-DESCRIPTION-LENGTH)
+)
+
+;; Helper function to check if principal is valid (not zero address)
+(define-private (is-valid-principal (addr principal))
+  (not (is-eq addr 'SP000000000000000000002Q6VF78))
+)
+
+;; Initialize contract with owner as first authorized admin
+(define-private (initialize-contract)
+  (map-set authorized-admins (var-get contract-owner) true)
+)
+
+;; Add authorized admin (owner only)
+(define-public (add-authorized-admin (admin principal))
+  (begin
+    (asserts! (is-contract-owner) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (is-valid-principal admin) ERR-INVALID-PRINCIPAL)
+    (map-set authorized-admins admin true)
+    (ok true)
+  )
+)
+
+;; Remove authorized admin (owner only)
+(define-public (remove-authorized-admin (admin principal))
+  (begin
+    (asserts! (is-contract-owner) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (is-valid-principal admin) ERR-INVALID-PRINCIPAL)
+    (map-delete authorized-admins admin)
+    (ok true)
+  )
+)
+
+;; Add approved recipient (admin only)
+(define-public (add-approved-recipient (recipient principal))
+  (begin
+    (asserts! (is-authorized-admin) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (is-valid-principal recipient) ERR-INVALID-PRINCIPAL)
+    (map-set approved-recipients recipient true)
+    (ok true)
+  )
+)
+
+;; Remove approved recipient (admin only)
+(define-public (remove-approved-recipient (recipient principal))
+  (begin
+    (asserts! (is-authorized-admin) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (is-valid-principal recipient) ERR-INVALID-PRINCIPAL)
+    (map-delete approved-recipients recipient)
+    (ok true)
+  )
 )
 
 ;; Register as a voter with required stake
@@ -127,12 +211,14 @@
   )
 )
 
-;; Deactivate voter (admin only)
+;; Deactivate voter (admin only) - FIXED: Added validation
 (define-public (deactivate-voter (voter principal))
   (begin
-    (asserts! (is-contract-owner) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (is-authorized-admin) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (is-valid-principal voter) ERR-INVALID-PRINCIPAL)
     (match (map-get? registered-voters voter)
       voter-data (begin
+        (asserts! (get is-active voter-data) ERR-NOT-ELIGIBLE-VOTER)
         (map-set registered-voters voter (merge voter-data {is-active: false}))
         (var-set total-registered-voters (- (var-get total-registered-voters) u1))
         (ok true)
@@ -142,7 +228,7 @@
   )
 )
 
-;; Propose a new infrastructure project
+;; Propose a new infrastructure project - FIXED: Added string validation
 (define-public (propose-project 
   (title (string-ascii 100)) 
   (description (string-ascii 500)) 
@@ -154,6 +240,8 @@
     (asserts! (is-eligible-voter tx-sender) ERR-NOT-ELIGIBLE-VOTER)
     (asserts! (>= budget MIN-PROPOSAL-AMOUNT) ERR-INVALID-AMOUNT)
     (asserts! (and (>= voting-period MIN-VOTING-PERIOD) (<= voting-period MAX-VOTING-PERIOD)) ERR-INVALID-VOTING-PERIOD)
+    (asserts! (is-valid-title title) ERR-INVALID-STRING-LENGTH)
+    (asserts! (is-valid-description description) ERR-INVALID-STRING-LENGTH)
     
     (map-set projects project-id {
       proposer: tx-sender,
@@ -178,7 +266,7 @@
 (define-public (start-voting (project-id uint) (voting-period uint))
   (let ((project (unwrap! (map-get? projects project-id) ERR-PROJECT-NOT-FOUND))
         (current-block (get-current-block)))
-    (asserts! (is-contract-owner) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (is-authorized-admin) ERR-UNAUTHORIZED-ACCESS)
     (asserts! (is-eq (get status project) STATUS-PROPOSED) ERR-INVALID-PROJECT-STATUS)
     (asserts! (and (>= voting-period MIN-VOTING-PERIOD) (<= voting-period MAX-VOTING-PERIOD)) ERR-INVALID-VOTING-PERIOD)
     
@@ -236,7 +324,7 @@
         (current-block (get-current-block))
         (required-quorum (calculate-quorum)))
     
-    (asserts! (is-contract-owner) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (is-authorized-admin) ERR-UNAUTHORIZED-ACCESS)
     (asserts! (is-eq (get status project) STATUS-VOTING) ERR-INVALID-PROJECT-STATUS)
     (asserts! (> current-block (get voting-end project)) ERR-VOTING-PERIOD-ACTIVE)
     (asserts! (>= (get total-voters project) required-quorum) ERR-QUORUM-NOT-MET)
@@ -269,10 +357,12 @@
   )
 )
 
-;; Execute approved project (admin only)
+;; Execute approved project (admin only) - FIXED: Added recipient validation
 (define-public (execute-project (project-id uint) (recipient principal))
   (let ((project (unwrap! (map-get? projects project-id) ERR-PROJECT-NOT-FOUND)))
-    (asserts! (is-contract-owner) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (is-authorized-admin) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (is-valid-principal recipient) ERR-INVALID-PRINCIPAL)
+    (asserts! (default-to false (map-get? approved-recipients recipient)) ERR-UNAUTHORIZED-ACCESS)
     (asserts! (is-eq (get status project) STATUS-APPROVED) ERR-INVALID-PROJECT-STATUS)
     
     (try! (as-contract (stx-transfer? (get budget project) tx-sender recipient)))
@@ -302,6 +392,17 @@
 ;; Get project contribution by contributor
 (define-read-only (get-project-contribution (project-id uint) (contributor principal))
   (default-to u0 (map-get? project-contributions {project-id: project-id, contributor: contributor}))
+)
+
+;; Check if principal is authorized admin
+(define-read-only (is-admin (principal principal))
+  (or (is-eq principal (var-get contract-owner)) 
+      (default-to false (map-get? authorized-admins principal)))
+)
+
+;; Check if recipient is approved
+(define-read-only (is-approved-recipient (recipient principal))
+  (default-to false (map-get? approved-recipients recipient))
 )
 
 ;; Get contract statistics
@@ -344,10 +445,15 @@
 
 ;; Administrative functions
 
-;; Update contract owner (current owner only)
+;; Update contract owner (current owner only) - FIXED: Added validation
 (define-public (set-contract-owner (new-owner principal))
   (begin
     (asserts! (is-contract-owner) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (is-valid-principal new-owner) ERR-INVALID-PRINCIPAL)
+    (asserts! (not (is-eq new-owner (var-get contract-owner))) ERR-INVALID-PRINCIPAL)
+    ;; Remove old owner from authorized admins and add new owner
+    (map-delete authorized-admins (var-get contract-owner))
+    (map-set authorized-admins new-owner true)
     (var-set contract-owner new-owner)
     (ok true)
   )
@@ -356,7 +462,7 @@
 ;; Update voting token requirement (admin only)
 (define-public (set-voting-token-requirement (new-amount uint))
   (begin
-    (asserts! (is-contract-owner) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (is-authorized-admin) ERR-UNAUTHORIZED-ACCESS)
     (asserts! (> new-amount u0) ERR-INVALID-AMOUNT)
     (var-set voting-token-required new-amount)
     (ok true)
